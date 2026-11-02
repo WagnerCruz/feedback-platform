@@ -1,0 +1,348 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Plataforma serverless de feedbacks de cursos online (Java 21, API Gateway, Lambda, DynamoDB, SNS, SES, EventBridge, CloudWatch)
+
+Parameters:
+  Ambiente:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, prod]
+    Description: Nome do ambiente (usado em nomes de recursos e no stage da API)
+  EmailAdministrador:
+    Type: String
+    Description: E-mail do administrador (recebe críticas, relatório semanal e alarmes). Deve estar verificado no SES.
+  EmailRemetente:
+    Type: String
+    Description: E-mail remetente verificado no SES
+
+Globals:
+  Function:
+    Runtime: java21
+    Architectures: [arm64]
+    MemorySize: 1024
+    Timeout: 30
+    Tracing: Active                       # X-Ray
+    SnapStart:
+      ApplyOn: PublishedVersions          # reduz o cold start de Java
+    AutoPublishAlias: live
+    Environment:
+      Variables:
+        JAVA_TOOL_OPTIONS: "-XX:+TieredCompilation -XX:TieredStopAtLevel=1"
+
+Resources:
+
+  # ------------------------------------------------------------------ Dados
+  AvaliacoesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub feedback-avaliacoes-${Ambiente}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: id, AttributeType: S }
+        - { AttributeName: dia, AttributeType: S }
+        - { AttributeName: dataEnvio, AttributeType: S }
+      KeySchema:
+        - { AttributeName: id, KeyType: HASH }
+      GlobalSecondaryIndexes:
+        - IndexName: indice-dia-dataEnvio
+          KeySchema:
+            - { AttributeName: dia, KeyType: HASH }
+            - { AttributeName: dataEnvio, KeyType: RANGE }
+          Projection:
+            ProjectionType: ALL
+      SSESpecification:
+        SSEEnabled: true                  # criptografia em repouso com chave KMS gerenciada (aws/dynamodb)
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+  # ------------------------------------------------------------ Mensageria
+  TopicoCritico:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub feedback-avaliacao-critica-${Ambiente}
+      KmsMasterKeyId: alias/aws/sns       # criptografia em repouso
+
+  # Tópico operacional sem CMK própria para que o CloudWatch Alarms consiga publicar.
+  TopicoAlertas:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub feedback-alertas-admin-${Ambiente}
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref EmailAdministrador
+
+  FilaDlqNotificacao:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub feedback-notificar-critico-dlq-${Ambiente}
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+
+  # ------------------------------------------------------------------- API
+  ApiAvaliacoes:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: !Sub feedback-api-${Ambiente}
+      StageName: !Ref Ambiente
+      TracingEnabled: true
+      MethodSettings:
+        - ResourcePath: '/*'
+          HttpMethod: '*'
+          MetricsEnabled: true
+          ThrottlingBurstLimit: 20
+          ThrottlingRateLimit: 10
+      Auth:
+        ApiKeyRequired: true              # evita uso anônimo/abuso
+        UsagePlan:
+          CreateUsagePlan: PER_API
+          UsagePlanName: !Sub feedback-plano-${Ambiente}
+          Throttle:
+            RateLimit: 10
+            BurstLimit: 20
+          Quota:
+            Limit: 5000
+            Period: DAY
+
+  # ---------------------------------------------------------------- Funções
+  ReceberAvaliacaoFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub feedback-receber-avaliacao-${Ambiente}
+      Description: Recebe POST /avaliacao, valida, persiste e publica avaliações críticas
+      CodeUri: receber-avaliacao/target/receber-avaliacao.jar
+      Handler: br.com.feedback.receber.ReceberAvaliacaoHandler::handleRequest
+      Environment:
+        Variables:
+          TABELA_AVALIACOES: !Ref AvaliacoesTable
+          TOPICO_CRITICO_ARN: !Ref TopicoCritico
+      Policies:                           # privilégio mínimo (role própria da função)
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: dynamodb:PutItem
+              Resource: !GetAtt AvaliacoesTable.Arn
+            - Effect: Allow
+              Action: sns:Publish
+              Resource: !Ref TopicoCritico
+      Events:
+        PostAvaliacao:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiAvaliacoes
+            Path: /avaliacao
+            Method: post
+
+  NotificarCriticoFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub feedback-notificar-critico-${Ambiente}
+      Description: Envia e-mail de urgência aos administradores para avaliações críticas
+      CodeUri: notificar-critico/target/notificar-critico.jar
+      Handler: br.com.feedback.notificar.NotificarCriticoHandler::handleRequest
+      Environment:
+        Variables:
+          EMAILS_ADMIN: !Ref EmailAdministrador
+          EMAIL_REMETENTE: !Ref EmailRemetente
+      DeadLetterQueue:
+        Type: SQS
+        TargetArn: !GetAtt FilaDlqNotificacao.Arn
+      EventInvokeConfig:
+        MaximumRetryAttempts: 2
+        MaximumEventAgeInSeconds: 3600
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: ses:SendEmail
+              Resource: '*'
+              Condition:
+                StringEquals:
+                  ses:FromAddress: !Ref EmailRemetente
+      Events:
+        CriticoSns:
+          Type: SNS
+          Properties:
+            Topic: !Ref TopicoCritico
+
+  RelatorioSemanalFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub feedback-relatorio-semanal-${Ambiente}
+      Description: Gera e envia o relatório semanal (média, quantidade por dia e por urgência)
+      CodeUri: relatorio-semanal/target/relatorio-semanal.jar
+      Handler: br.com.feedback.relatorio.RelatorioSemanalHandler::handleRequest
+      Timeout: 120
+      Environment:
+        Variables:
+          TABELA_AVALIACOES: !Ref AvaliacoesTable
+          EMAILS_ADMIN: !Ref EmailAdministrador
+          EMAIL_REMETENTE: !Ref EmailRemetente
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: dynamodb:Query
+              Resource: !Sub '${AvaliacoesTable.Arn}/index/indice-dia-dataEnvio'
+            - Effect: Allow
+              Action: ses:SendEmail
+              Resource: '*'
+              Condition:
+                StringEquals:
+                  ses:FromAddress: !Ref EmailRemetente
+      Events:
+        SegundaDeManha:
+          Type: Schedule
+          Properties:
+            Schedule: cron(0 11 ? * MON *)   # 11:00 UTC = 08:00 em Brasília
+            Description: Relatório semanal de avaliações
+
+  # ------------------------------------------------------------------ Logs
+  LogsReceber:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/feedback-receber-avaliacao-${Ambiente}
+      RetentionInDays: 30
+  LogsNotificar:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/feedback-notificar-critico-${Ambiente}
+      RetentionInDays: 30
+  LogsRelatorio:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/feedback-relatorio-semanal-${Ambiente}
+      RetentionInDays: 30
+
+  # --------------------------------------------------------------- Alarmes
+  AlarmeErrosReceber:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub feedback-${Ambiente}-erros-receber-avaliacao
+      AlarmDescription: A função de recebimento retornou erros
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions: [{ Name: FunctionName, Value: !Ref ReceberAvaliacaoFunction }]
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref TopicoAlertas]
+
+  AlarmeErrosNotificar:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub feedback-${Ambiente}-erros-notificar-critico
+      AlarmDescription: Falha ao enviar notificação de avaliação crítica
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions: [{ Name: FunctionName, Value: !Ref NotificarCriticoFunction }]
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref TopicoAlertas]
+
+  AlarmeErrosRelatorio:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub feedback-${Ambiente}-erros-relatorio-semanal
+      AlarmDescription: Falha na geração/envio do relatório semanal
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions: [{ Name: FunctionName, Value: !Ref RelatorioSemanalFunction }]
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref TopicoAlertas]
+
+  AlarmeApi5xx:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub feedback-${Ambiente}-api-5xx
+      AlarmDescription: A API retornou erros 5xx
+      Namespace: AWS/ApiGateway
+      MetricName: 5XXError
+      Dimensions:
+        - { Name: ApiName, Value: !Sub 'feedback-api-${Ambiente}' }
+        - { Name: Stage, Value: !Ref Ambiente }
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref TopicoAlertas]
+
+  AlarmeDlq:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub feedback-${Ambiente}-dlq-com-mensagens
+      AlarmDescription: Notificações críticas que não puderam ser entregues (DLQ)
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions: [{ Name: QueueName, Value: !GetAtt FilaDlqNotificacao.QueueName }]
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref TopicoAlertas]
+
+  # ------------------------------------------------------------- Dashboard
+  Dashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub feedback-${Ambiente}
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            { "type": "metric", "x": 0, "y": 0, "width": 12, "height": 6,
+              "properties": { "title": "Lambda - Invocações", "region": "${AWS::Region}", "stat": "Sum", "period": 60,
+                "metrics": [
+                  ["AWS/Lambda","Invocations","FunctionName","feedback-receber-avaliacao-${Ambiente}"],
+                  ["AWS/Lambda","Invocations","FunctionName","feedback-notificar-critico-${Ambiente}"],
+                  ["AWS/Lambda","Invocations","FunctionName","feedback-relatorio-semanal-${Ambiente}"] ] } },
+            { "type": "metric", "x": 12, "y": 0, "width": 12, "height": 6,
+              "properties": { "title": "Lambda - Erros", "region": "${AWS::Region}", "stat": "Sum", "period": 60,
+                "metrics": [
+                  ["AWS/Lambda","Errors","FunctionName","feedback-receber-avaliacao-${Ambiente}"],
+                  ["AWS/Lambda","Errors","FunctionName","feedback-notificar-critico-${Ambiente}"],
+                  ["AWS/Lambda","Errors","FunctionName","feedback-relatorio-semanal-${Ambiente}"] ] } },
+            { "type": "metric", "x": 0, "y": 6, "width": 12, "height": 6,
+              "properties": { "title": "Lambda - Duração (p95)", "region": "${AWS::Region}", "stat": "p95", "period": 60,
+                "metrics": [
+                  ["AWS/Lambda","Duration","FunctionName","feedback-receber-avaliacao-${Ambiente}"],
+                  ["AWS/Lambda","Duration","FunctionName","feedback-notificar-critico-${Ambiente}"],
+                  ["AWS/Lambda","Duration","FunctionName","feedback-relatorio-semanal-${Ambiente}"] ] } },
+            { "type": "metric", "x": 12, "y": 6, "width": 12, "height": 6,
+              "properties": { "title": "API Gateway - Requisições, 4xx e 5xx", "region": "${AWS::Region}", "stat": "Sum", "period": 60,
+                "metrics": [
+                  ["AWS/ApiGateway","Count","ApiName","feedback-api-${Ambiente}","Stage","${Ambiente}"],
+                  ["AWS/ApiGateway","4XXError","ApiName","feedback-api-${Ambiente}","Stage","${Ambiente}"],
+                  ["AWS/ApiGateway","5XXError","ApiName","feedback-api-${Ambiente}","Stage","${Ambiente}"] ] } },
+            { "type": "metric", "x": 0, "y": 12, "width": 12, "height": 6,
+              "properties": { "title": "DLQ - Mensagens pendentes", "region": "${AWS::Region}", "stat": "Maximum", "period": 60,
+                "metrics": [
+                  ["AWS/SQS","ApproximateNumberOfMessagesVisible","QueueName","feedback-notificar-critico-dlq-${Ambiente}"] ] } }
+          ]
+        }
+
+Outputs:
+  ApiUrl:
+    Description: URL do endpoint POST /avaliacao
+    Value: !Sub https://${ApiAvaliacoes}.execute-api.${AWS::Region}.amazonaws.com/${Ambiente}/avaliacao
+  ChaveApiConsulta:
+    Description: Obter o valor da API key com `aws apigateway get-api-keys --include-values`
+    Value: !Sub feedback-api-${Ambiente}
+  TabelaAvaliacoes:
+    Value: !Ref AvaliacoesTable
+  TopicoAlertas:
+    Value: !Ref TopicoAlertas
